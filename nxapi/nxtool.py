@@ -4,6 +4,7 @@ import glob, fcntl, termios
 import sys
 import socket
 import elasticsearch 
+import time
 from optparse import OptionParser, OptionGroup
 from nxapi.nxtransform import *
 from nxapi.nxparse import *
@@ -32,11 +33,12 @@ def open_fifo(fifo):
 
 def macquire(line):
     z = parser.parse_raw_line(line)
-    # add data str and coords
+    # add data str and country
     if z is not None:
         for event in z['events']:
             event['date'] = z['date']
-            event['coord'] = geoloc.ip2ll(event['ip'])
+            event['coords'] = geoloc.ip2ll(event['ip'])
+            event['country'] = geoloc.ip2cc(event['ip'])
         # print "Got data :)"
         # pprint.pprint(z)
         #print ".",
@@ -80,6 +82,7 @@ p = OptionGroup(opt, "Whitelist Generation")
 p.add_option('-f', '--full-auto', dest="full_auto", action="store_true", help="Attempt fully automatic whitelist generation process.")
 p.add_option('-t', '--template', dest="template", help="Path to template to apply.")
 p.add_option('--slack', dest="slack", action="store_false", help="Enables less strict mode.")
+p.add_option('--type', dest="type_wl", action="store_true", help="Generate whitelists based on param type")
 opt.add_option_group(p)
 # group : statistics
 p = OptionGroup(opt, "Statistics Generation")
@@ -103,7 +106,7 @@ cfg.cfg["naxsi"]["strict"] = str(options.slack).lower()
 if options.filter is not None:
     x = {}
     to_parse = []
-    kwlist = ['server', 'uri', 'zone', 'var_name', 'ip', 'id', 'content', 'date',
+    kwlist = ['server', 'uri', 'zone', 'var_name', 'ip', 'id', 'content', 'country', 'date',
               '?server', '?uri', '?var_name', '?content']
     try:
         for argstr in options.filter:
@@ -128,6 +131,9 @@ es = elasticsearch.Elasticsearch(cfg.cfg["elastic"]["host"])
 translate = NxTranslate(es, cfg)
 
 
+if options.type_wl is True:
+    translate.wl_on_type()
+    sys.exit(1)
 
 # whitelist generation options
 if options.full_auto is True:
@@ -238,7 +244,14 @@ if options.files_in is not None or options.fifo_in is not None or options.stdin 
     else:
         injector = ESInject(es, cfg.cfg)
     parser = NxParser()
-    parser.out_date_format = "%Y-%m-%dT%H:%M:%S+02" #ES-friendly
+    offset = time.timezone if (time.localtime().tm_isdst == 0) else time.altzone
+    offset = offset / 60 / 60 * -1
+    if offset < 0:
+        offset = str(-offset)
+    else:
+        offset = str(offset)
+    offset = offset.zfill(2)
+    parser.out_date_format = "%Y-%m-%dT%H:%M:%S+"+offset #ES-friendly
     try:
         geoloc = NxGeoLoc(cfg.cfg)
     except:

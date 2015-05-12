@@ -32,7 +32,7 @@
 #ifndef __FOO_H__
 #define __FOO_H__
 
-#define NAXSI_VERSION "0.53-1"
+#define NAXSI_VERSION "0.54"
 
 #include <nginx.h>
 #include <ngx_config.h>
@@ -43,11 +43,18 @@
 #include <ngx_http_core_module.h>
 #include <pcre.h>
 #include <ctype.h>
+#include "ext/libinjection/libinjection_sqli.h"
+#include "ext/libinjection/libinjection_xss.h"
 
 
 extern ngx_module_t ngx_http_naxsi_module;
 
-#define UPDATE_C(js) js->c = *(js->src + js->off)
+#ifdef whitelist_debug
+    #define naxsi_whitelist_debug(...)
+#else
+    #define naxsi_whitelist_debug(...) ngx_log_debug(NGX_LOG_DEBUG_HTTP, req->connection->log, 0, __VA_ARGS__)
+#endif
+
 
 /*
 ** Here is globally how the structures are organized :
@@ -282,7 +289,6 @@ typedef struct
   ngx_array_t	*generic_rules; 
   ngx_array_t	*locations; /*ngx_http_dummy_loc_conf_t*/
   ngx_log_t	*log;
-  ngx_array_t   *naxsi_logs; /* array of ngx_naxsi_log_t */
   
 } ngx_http_dummy_main_conf_t;
 
@@ -322,6 +328,8 @@ typedef struct
   ngx_flag_t	enabled:1;
   ngx_flag_t	force_disabled:1;
   ngx_flag_t	pushed:1;
+  ngx_flag_t	libinjection_sql_enabled:1;
+  ngx_flag_t	libinjection_xss_enabled:1;
   ngx_str_t	*denied_url;
   /* precomputed hash for dynamic variable lookup, 
      variable themselves are boolean */
@@ -329,7 +337,10 @@ typedef struct
   ngx_uint_t	flag_learning_h;
   ngx_uint_t	flag_post_action_h;
   ngx_uint_t	flag_extensive_log_h;
-  ngx_array_t   *naxsi_logs; /* array of ngx_naxsi_log_t */
+  /* precomputed hash for 
+     libinjection dynamic flags */
+  ngx_uint_t	flag_libinjection_xss_h;
+  ngx_uint_t	flag_libinjection_sql_h;
   
 } ngx_http_dummy_loc_conf_t;
 
@@ -379,7 +390,9 @@ typedef struct
   ngx_flag_t	enabled:1;
   ngx_flag_t	post_action:1;
   ngx_flag_t	extensive_log:1;
-  
+  /* did libinjection sql/xss matched ? */
+  ngx_flag_t	libinjection_sql:1;
+  ngx_flag_t	libinjection_xss:1;
 } ngx_http_request_ctx_t;
 
 /*
@@ -407,7 +420,8 @@ typedef struct ngx_http_nx_json_s {
 #define TOP_CHECK_RULE_T	"CheckRule"
 #define TOP_BASIC_RULE_T	"BasicRule"
 #define TOP_MAIN_BASIC_RULE_T	"MainRule"
-#define TOP_NAXSI_LOGFILE_T	"NaxsiLogFile"
+#define TOP_LIBINJECTION_SQL_T	"LibInjectionSql"
+#define TOP_LIBINJECTION_XSS_T	"LibInjectionXss"
 
 /* nginx-style names */
 #define TOP_DENIED_URL_N	"denied_url"
@@ -417,7 +431,9 @@ typedef struct ngx_http_nx_json_s {
 #define TOP_CHECK_RULE_N	"check_rule"
 #define TOP_BASIC_RULE_N	"basic_rule"
 #define TOP_MAIN_BASIC_RULE_N	"main_rule"
-#define TOP_NAXSI_LOGFILE_N	"naxsi_log"
+#define TOP_LIBINJECTION_SQL_N	"libinjection_sql"
+#define TOP_LIBINJECTION_XSS_N	"libinjection_xss"
+
 
 /*possible 'tokens' in rule */
 #define ID_T "id:"
@@ -437,7 +453,8 @@ typedef struct ngx_http_nx_json_s {
 #define RT_ENABLE "naxsi_flag_enable"
 #define RT_LEARNING "naxsi_flag_learning"
 #define RT_POST_ACTION "naxsi_flag_post_action"
-
+#define RT_LIBINJECTION_SQL "naxsi_flag_libinjection_sql"
+#define RT_LIBINJECTION_XSS "naxsi_flag_libinjection_xss"
 
 
 /*
@@ -454,18 +471,12 @@ void			*ngx_http_dummy_cfg_parse_one_rule(ngx_conf_t *cf,
 char			*strfaststr(unsigned char *haystack, unsigned int hl,
 				    unsigned char *needle, unsigned int nl);
 char			*strnchr(const char *s, int c, int len);
-char			*strncasechr(const char *s, int c, int len);
-ngx_int_t		ngx_http_dummy_create_hashtables(ngx_http_dummy_loc_conf_t *dlc,
-							 ngx_conf_t *cf);
 ngx_int_t		ngx_http_dummy_create_hashtables_n(ngx_http_dummy_loc_conf_t *dlc,
 							   ngx_conf_t *cf);
 void			ngx_http_dummy_data_parse(ngx_http_request_ctx_t *ctx, 
 						  ngx_http_request_t	 *r);
 ngx_int_t		ngx_http_output_forbidden_page(ngx_http_request_ctx_t *ctx, 
 						       ngx_http_request_t *r);
-int			naxsi_unescape_uri(u_char **dst, u_char **src, size_t size, 
-					   ngx_uint_t type);
-
 int			nx_check_ids(ngx_int_t match_id, ngx_array_t *wl_ids);
 int			naxsi_unescape(ngx_str_t *str);
 
@@ -474,7 +485,12 @@ void			ngx_http_dummy_json_parse(ngx_http_request_ctx_t *ctx,
 						  u_char		 *src,
 						  u_int			 len);
 
-
+void			ngx_http_libinjection(ngx_pool_t *pool,
+					       ngx_str_t	*name,
+					       ngx_str_t	*value,
+					       ngx_http_request_ctx_t *ctx,
+					       ngx_http_request_t *req,
+					       enum DUMMY_MATCH_ZONE	zone);
 /*
 ** JSON parsing prototypes.
 */
@@ -516,36 +532,16 @@ int			ngx_http_apply_rulematch_v_n(ngx_http_rule_t *r, ngx_http_request_ctx_t *c
 						     ngx_str_t *value, enum DUMMY_MATCH_ZONE zone, 
 						     ngx_int_t nb_match, ngx_int_t target_name);
 
-typedef struct {
-    ngx_open_file_t            *file;
-    //ngx_http_log_script_t      *script;
-    time_t                      disk_full_time;
-    time_t                      error_log_time;
-    //ngx_http_log_fmt_t         *format;
-} ngx_naxsi_log_t;
 
 
-#if (NGX_HAVE_C99_VARIADIC_MACROS)
-#define NGX_HAVE_VARIADIC_MACROS  1
+/*
+** externs for internal rules that requires it.
+*/
+extern ngx_http_rule_t *nx_int__libinject_sql;
+extern ngx_http_rule_t *nx_int__libinject_xss;
 
-void ngx_log_naxsi(ngx_uint_t level, ngx_http_request_t *r, ngx_err_t err,
-    const char *fmt, ...);
-
-#elif (NGX_HAVE_GCC_VARIADIC_MACROS)
-
-#define NGX_HAVE_VARIADIC_MACROS  1
-void
-ngx_log_naxsi(ngx_uint_t level, ngx_http_request_t *r, ngx_err_t err,
-    const char *fmt, ...);
-
-#else /* NO VARIADIC MACROS */
-
-#define NGX_HAVE_VARIADIC_MACROS  0
-void ngx_cdecl ngx_log_naxsi(ngx_uint_t level, ngx_http_request_t *r, ngx_err_t err,
-    const char *fmt, va_list args);
-
-#endif /* VARIADIC MACROS */
-
+/*libinjection_xss wrapper not exported by libinject_xss.h.*/
+int libinjection_xss(const char* s, size_t len); 
 
 
 #endif
